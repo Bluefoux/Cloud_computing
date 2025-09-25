@@ -1,0 +1,161 @@
+apiVersion: v1
+kind: Namespace
+metadata: { name: newwebsite }
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: mysql-secret, namespace: newwebsite }
+type: Opaque
+stringData:
+  MYSQL_ROOT_PASSWORD: "my-secret-pw"
+  DB_PASSWORD: "my-secret-pw"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: backend-config, namespace: newwebsite }
+data:
+  DB_HOST: "mysql"
+  DB_PORT: "3306"
+  DB_USER: "root"
+  DB_NAME: "my_database"
+  DATABASE_URL: "mysql://root:my-secret-pw@mysql:3306/my_database"
+  PORT: "3300"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: mysql-pvc, namespace: newwebsite }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources: { requests: { storage: 5Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: mysql, namespace: newwebsite }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: mysql } }
+  template:
+    metadata: { labels: { app: mysql } }
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          ports: [{ containerPort: 3306 }]
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: mysql-secret, key: MYSQL_ROOT_PASSWORD } }
+            - { name: MYSQL_DATABASE, value: "my_database" }
+            - { name: MYSQL_ROOT_HOST, value: "%" }
+          volumeMounts:
+            - { name: mysql-data, mountPath: /var/lib/mysql }
+          readinessProbe:
+            exec:
+              command: ["bash","-lc","mysqladmin ping -h 127.0.0.1 -u root -p$MYSQL_ROOT_PASSWORD --silent"]
+            initialDelaySeconds: 15
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["bash","-lc","mysqladmin ping -h 127.0.0.1 -u root -p$MYSQL_ROOT_PASSWORD --silent"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: mysql-data
+          persistentVolumeClaim: { claimName: mysql-pvc }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: mysql, namespace: newwebsite }
+spec:
+  selector: { app: mysql }
+  ports:
+    - { name: mysql, port: 3306, targetPort: 3306 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: backend, namespace: newwebsite }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: backend } }
+  template:
+    metadata: { labels: { app: backend } }
+    spec:
+      containers:
+        - name: backend
+          image: newwebsite-backend:local
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 3300 }]
+          envFrom:
+            - configMapRef: { name: backend-config }
+            - secretRef: { name: mysql-secret }
+          readinessProbe:
+            httpGet: { path: /health, port: 3300 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 3300 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata: { name: backend, namespace: newwebsite }
+spec:
+  selector: { app: backend }
+  ports:
+    - { name: http, port: 80, targetPort: 3300 }
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: frontend, namespace: newwebsite }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: frontend } }
+  template:
+    metadata: { labels: { app: frontend } }
+    spec:
+      containers:
+        - name: frontend
+          image: newwebsite-frontend:local
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 3000 }]
+          env:
+            - name: REACT_APP_API_URL
+              value: "http://app.127.0.0.1.nip.io"
+          readinessProbe:
+            httpGet: { path: /, port: 3000 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /, port: 3000 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata: { name: frontend, namespace: newwebsite }
+spec:
+  selector: { app: frontend }
+  ports:
+    - { name: http, port: 80, targetPort: 3000 }
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app
+  namespace: newwebsite
+  annotations:
+    kubernetes.io/ingress.class: traefik
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  rules:
+    - host: app.127.0.0.1.nip.io
+      http:
+        paths:
+          - path: /public
+            pathType: Prefix
+            backend: { service: { name: backend, port: { number: 80 } } }
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: frontend, port: { number: 80 } } }
